@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-speak",
+  "description": "Local text-to-speech for Claude Code",
+  "owner": {
+    "name": "mericstam"
+  },
+  "plugins": [
+    {
+      "name": "kokoro-speak",
+      "source": "./",
+      "description": "Reads Claude's replies aloud with local text-to-speech: Kokoro for English, Piper voices for 41 more languages"
+    }
+  ]
+}
