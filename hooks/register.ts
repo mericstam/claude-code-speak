@@ -1,5 +1,6 @@
 /*---------------------------------------------------------------------------------------------
- *  Claude Speak — reads each Claude Code reply aloud with Kokoro TTS.
+ *  Claude Speak — reads each Claude Code reply aloud: English with Kokoro, other languages
+ *  with a Piper voice each (/speak lang add <language>), picked per sentence.
  *  A port of copilot-cli-speak. Speech runs in bridge/bridge.mjs + tts-worker.mjs, copied to
  *  a home of their own and started under one of two backends:
  *    native   Linux (or macOS) node in ~/.claude-speak; on WSL it plays through WSLg
@@ -7,6 +8,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { EngineInterface as Engine, Register } from 'claude-code'
+
+import { PIPER_LANGUAGES } from './piper-voices'
 
 const MAX_CHARS = 1500
 
@@ -19,12 +22,53 @@ const VOICES = [
 ]
 
 type Backend = 'native' | 'windows'
-type Settings = { enabled: boolean; speed: number; voice: number; swedish: boolean; backend: Backend | 'auto' }
-const DEFAULTS: Settings = {
-  enabled: true, speed: 1.0, voice: VOICES.indexOf('bm_george'), swedish: false, backend: 'auto',
+type Settings = {
+  enabled: boolean
+  speed: number
+  voice: number
+  languages: Record<string, string> // language code → Piper voice id, besides English
+  backend: Backend | 'auto'
 }
-const USAGE =
-  'Usage: /speak [on|off|speed <0.5-2>|voice <name>|swedish on|off|backend auto|native|windows|say <text>]'
+const DEFAULTS: Settings = {
+  enabled: true,
+  speed: 1.0,
+  voice: VOICES.indexOf('bm_george'),
+  languages: { sv: 'sv_SE-nst-medium' },
+  backend: 'auto',
+}
+const USAGE = [
+  'Usage:',
+  '  /speak                        toggle speak mode (also: on, off)',
+  '  /speak speed <0.5-2>          speaking speed',
+  '  /speak voice <name>           English voice',
+  '  /speak lang                   languages read besides English, and all available',
+  '  /speak lang add <language> [voice]   e.g. /speak lang add german',
+  '  /speak lang remove <language>',
+  '  /speak lang voices <language> the voices of a language',
+  '  /speak backend auto|native|windows',
+  '  /speak say <text>             speak a line now',
+].join('\n')
+
+// A language by code, English name or own name: "de", "german", "Deutsch"
+function findLanguage(query: string): string | undefined {
+  const q = query.trim().toLowerCase()
+  return Object.keys(PIPER_LANGUAGES).find(code => {
+    const lang = PIPER_LANGUAGES[code]!
+    return code === q || lang.name.toLowerCase() === q || lang.native.toLowerCase() === q
+  })
+}
+
+// A voice of a language by id or part of it: "sv_SE-alma-medium", "alma", "alma-medium"
+function findVoice(code: string, query: string): string | undefined {
+  const q = query.trim().toLowerCase()
+  const ids = PIPER_LANGUAGES[code]!.voices.map(v => v.id)
+  return (
+    ids.find(id => id.toLowerCase() === q) ??
+    ids.find(id => id.toLowerCase().endsWith(`-${q}`)) ??
+    ids.find(id => id.toLowerCase().includes(`-${q}-`) && id.endsWith('-medium')) ??
+    ids.find(id => id.toLowerCase().includes(`-${q}-`))
+  )
+}
 
 // ── Text sanitization (same rules as copilot-cli-speak) ────────────
 
@@ -123,15 +167,92 @@ async function enqueue($: Engine, text: string) {
   const name = `${Date.now()}-${sessionTag}-${String(++seq).padStart(4, '0')}.json`
   await $.fs.write(
     `${home}/spool/${name}`,
-    JSON.stringify({ text: sanitized, speed: settings.speed, sid: settings.voice, swedish: settings.swedish }),
+    JSON.stringify({ text: sanitized, speed: settings.speed, sid: settings.voice, languages: spoolLanguages() }),
   )
   await reportStatus($)
+}
+
+function spoolLanguages() {
+  return Object.entries(settings.languages)
+    .filter(([code]) => PIPER_LANGUAGES[code])
+    .map(([code, voice]) => ({ franc: PIPER_LANGUAGES[code]!.franc, voice }))
+}
+
+// Asks the bridge to download the enabled languages' voices now
+async function prepareVoices($: Engine) {
+  if (!home) return
+  await ensureBridge($)
+  const name = `${Date.now()}-${sessionTag}-${String(++seq).padStart(4, '0')}.json`
+  await $.fs.write(`${home}/spool/${name}`, JSON.stringify({ prepare: true, languages: spoolLanguages() }))
+}
+
+async function voiceState($: Engine, voice: string): Promise<string> {
+  if (!home) return 'not downloaded'
+  if (await $.fs.exists(`${home}/models/vits-piper-${voice}/${voice}.onnx`)) return 'ready'
+  if (await $.fs.exists(`${home}/models/.download-${voice}.tar.bz2`)) return 'downloading…'
+  return 'not downloaded yet'
+}
+
+async function describeLanguages($: Engine): Promise<string> {
+  const lines = ['Read aloud besides English (Kokoro):']
+  const enabled = Object.entries(settings.languages).filter(([code]) => PIPER_LANGUAGES[code])
+  if (!enabled.length) lines.push('  none')
+  for (const [code, voice] of enabled) {
+    lines.push(`  ${code}  ${PIPER_LANGUAGES[code]!.name.padEnd(14)} ${voice.padEnd(34)} ${await voiceState($, voice)}`)
+  }
+  const available = Object.entries(PIPER_LANGUAGES)
+    .filter(([code]) => !settings.languages[code])
+    .map(([code, lang]) => `${code} ${lang.name}`)
+  lines.push('', `Available: ${available.join(', ')}`, '', 'Add one with /speak lang add <language>, e.g. /speak lang add german')
+  return lines.join('\n')
+}
+
+async function languageCommand($: Engine, args: string[]): Promise<string> {
+  const [action = '', query = '', ...rest] = args
+  if (!action) return describeLanguages($)
+
+  const code = findLanguage(query)
+  if (!code) {
+    if (['en', 'english'].includes(query.toLowerCase())) return 'English is always read, by Kokoro: pick its voice with /speak voice.'
+    return `Unknown language "${query}". ${(await describeLanguages($)).split('\n\n')[1]}`
+  }
+  const lang = PIPER_LANGUAGES[code]!
+
+  switch (action.toLowerCase()) {
+    case 'add': {
+      const voice = rest.length ? findVoice(code, rest.join(' ')) : lang.voice
+      if (!voice) return `No ${lang.name} voice "${rest.join(' ')}". See /speak lang voices ${code}.`
+      settings.languages = { ...settings.languages, [code]: voice }
+      await $.store.set('settings', settings)
+      await prepareVoices($)
+      const mb = lang.voices.find(v => v.id === voice)?.mb
+      const state = await voiceState($, voice)
+      return state === 'ready'
+        ? `🔊 ${lang.name} added: ${voice}.`
+        : `🔊 ${lang.name} added: ${voice}. Downloading it (~${mb} MB) in the background; until then ${lang.name} is read by the English voice.`
+    }
+    case 'remove': {
+      const { [code]: _, ...others } = settings.languages
+      settings.languages = others
+      await $.store.set('settings', settings)
+      return `🔊 ${lang.name} removed. Its voice stays downloaded under ${home}/models.`
+    }
+    case 'voices': {
+      const current = settings.languages[code] ?? lang.voice
+      return [
+        `${lang.name} voices (pick one with /speak lang add ${code} <voice>):`,
+        ...lang.voices.map(v => `  ${v.id === current ? '*' : ' '} ${v.id.padEnd(36)} ${v.mb} MB`),
+      ].join('\n')
+    }
+    default:
+      return USAGE
+  }
 }
 
 function describe(): string {
   return (
     `🔊 Speak mode ${settings.enabled ? 'on' : 'off'} · voice ${VOICES[settings.voice]} · ` +
-    `speed ${settings.speed} · Swedish ${settings.swedish ? 'on' : 'off'} · ` +
+    `speed ${settings.speed} · languages ${['English', ...Object.keys(settings.languages).map(c => PIPER_LANGUAGES[c]?.name ?? c)].join(', ')} · ` +
     `backend ${backend}${settings.backend === 'auto' ? ' (auto)' : ''}`
   )
 }
@@ -140,14 +261,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
 
-    const stored = (await $.store.get('settings')) as Partial<Settings> | undefined
+    // A `swedish` flag of an older version is left behind: languages replaced it
+    const { swedish: _, ...stored } = ((await $.store.get('settings')) ?? {}) as Partial<Settings> & { swedish?: boolean }
     settings = { ...DEFAULTS, ...stored }
     isWsl = (await $.env.get('WSL_DISTRO_NAME')) !== undefined
 
     await $.command.register({
       name: 'speak',
-      description: 'Speak mode: on | off | speed | voice | swedish | backend | say <text>',
-      argumentHint: '[on|off|speed|voice|swedish|backend|say]',
+      description: 'Speak mode: on | off | speed | voice | lang [add|remove|voices] | backend | say <text>',
+      argumentHint: '[on|off|speed|voice|lang|backend|say|help]',
     })
 
     const problem = await setupBackend($)
@@ -160,6 +282,7 @@ export const register: Register = on => {
     if (settings.enabled) {
       await ensureBridge($)
       await reportStatus($)
+      await prepareVoices($)
     }
     $.ui.status(settings.enabled ? '🔊' : undefined)
     return started
@@ -199,9 +322,12 @@ export const register: Register = on => {
         settings.voice = i
         break
       }
-      case 'swedish':
-        settings.swedish = value === 'on'
-        break
+      case 'lang':
+      case 'language':
+      case 'languages':
+        return { text: await languageCommand($, rest) }
+      case 'help':
+        return { text: USAGE }
       case 'backend': {
         if (value !== 'auto' && value !== 'native' && value !== 'windows') return { text: USAGE }
         const previous = settings.backend

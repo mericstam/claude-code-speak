@@ -1,15 +1,17 @@
 // Persistent TTS worker — stays alive, receives commands via stdin JSON lines.
-// Adapted from copilot-cli-speak: generates speech via sherpa-onnx and streams PCM
+// Adapted from copilot-cli-speak: generates speech via sherpa-onnx (Kokoro for English,
+// a Piper voice per other enabled language, picked per sentence) and streams PCM
 // to a player (ffplay on Windows/macOS; paplay, pw-play, aplay or ffplay on Linux).
 //
 //   node tts-worker.mjs <claude-speak home>
 //
-// The home holds node_modules/sherpa-onnx-node and models/, both set up by bridge.mjs.
+// The home holds node_modules (sherpa-onnx-node, franc-all) and models/, all set up by bridge.mjs.
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { spawn, execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
-import { existsSync, mkdirSync, unlinkSync, statSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, statSync, appendFileSync, readdirSync } from "node:fs";
 import { platform as osPlatform, availableParallelism } from "node:os";
 
 const homeDir = process.argv[2];
@@ -28,9 +30,9 @@ const require = createRequire(join(homeDir, "package.json"));
 log("loading sherpa-onnx...");
 const sherpa_onnx = require("sherpa-onnx-node");
 log("sherpa-onnx loaded");
+const { francAll } = await import(pathToFileURL(join(homeDir, "node_modules", "franc-all", "index.js")).href);
 
 const MODEL_DIR = join(homeDir, "models", "kokoro-en-v0_19");
-const SV_MODEL_DIR = join(homeDir, "models", "vits-piper-sv_SE-nst-medium");
 const FFPLAY_DIR = join(homeDir, "ffplay");
 const NUM_THREADS = Math.max(2, Math.min(8, availableParallelism()));
 
@@ -127,63 +129,71 @@ const ttsEn = new sherpa_onnx.OfflineTts({
 });
 log("TTS instance created");
 
-// Swedish voice (Piper NST) is loaded lazily the first time Swedish text shows up
-let ttsSv = null;
-let svLoadFailed = false;
-function getSvTts() {
-    if (ttsSv || svLoadFailed) return ttsSv;
-    const model = join(SV_MODEL_DIR, "sv_SE-nst-medium.onnx");
+// Piper voices are loaded lazily, the first time a sentence in their language shows up
+// (bridge.mjs downloads them; until one is there its language is read by Kokoro)
+const piper = new Map(); // voice id → OfflineTts, or null when it failed to load
+function getPiper(voice) {
+    if (piper.has(voice)) return piper.get(voice);
+    const dir = join(homeDir, "models", `vits-piper-${voice}`);
+    const model = join(dir, `${voice}.onnx`);
     if (!existsSync(model)) return null;
+    let tts = null;
     try {
-        log("loading Swedish TTS...");
-        ttsSv = new sherpa_onnx.OfflineTts({
+        log(`loading Piper voice ${voice}...`);
+        const has = (f) => existsSync(join(dir, f));
+        // Most voices phonemize with espeak-ng; the Chinese ones use a lexicon and rule FSTs
+        const ruleFsts = readdirSync(dir).filter((f) => f.endsWith(".fst")).map((f) => join(dir, f)).join(",");
+        tts = new sherpa_onnx.OfflineTts({
             model: {
                 vits: {
                     model,
-                    tokens: join(SV_MODEL_DIR, "tokens.txt"),
-                    dataDir: join(SV_MODEL_DIR, "espeak-ng-data"),
+                    tokens: join(dir, "tokens.txt"),
+                    ...(has("espeak-ng-data") && { dataDir: join(dir, "espeak-ng-data") }),
+                    ...(has("lexicon.txt") && { lexicon: join(dir, "lexicon.txt") }),
                 },
                 debug: false,
                 numThreads: NUM_THREADS,
                 provider: "cpu",
             },
+            ...(ruleFsts && { ruleFsts }),
             maxNumSentences: 1,
         });
-        log("Swedish TTS loaded");
+        log(`Piper voice ${voice} loaded`);
     } catch (err) {
-        svLoadFailed = true;
-        log(`Swedish TTS load failed: ${err.message}`);
+        log(`Piper voice ${voice} failed to load: ${err.message}`);
     }
-    return ttsSv;
+    piper.set(voice, tts);
+    return tts;
 }
 
-// ── Language detection (English vs Swedish) ────────────────────────
+// ── Language detection ─────────────────────────────────────────────
 
-const SV_WORDS = new Set(("och att det som är på av för med inte har jag du vi den till om men så ett kan från " +
-    "de här när ska vara mig dig också eller sig vid hej tack ja nej vad hur var vill kommer får bara mycket dem " +
-    "deras vår din min mitt denna dessa alla efter över under sedan utan genom mot hos lite igen nu då själv ingen " +
-    "något någon där oss er ni hon han").split(" "));
-const EN_WORDS = new Set(("the and of to is a in that it for with you this are on as be not have can but was " +
-    "will your i we they he she if or at by from an all so what how about would there been which when do no yes " +
-    "my me just here now then them these those its it's i'm don't you're i'll let's").split(" "));
+// Replies are mostly English, and franc alone often takes a short English sentence for another
+// language ("Run npm test now." reads as French). So a Latin-script sentence leaves English only
+// on clear evidence: franc's pick beats English by a margin, and few words are common English.
+// One-word sentences ("Done.", "Hej!") take a neighbour's language.
+const EN_WORDS = new Set(("the and of to it for with you this are on as be not have can but was will your i we they he " +
+    "she if or at by from all so what how about would there been which when do yes my just here now then them these " +
+    "those its it's i'm don't you're i'll let's that want should could please thanks done works fixed run passed " +
+    "failed ok okay").split(" "));
+const NON_LATIN = /[^\u0000-\u024f\u1e00-\u1eff\s\d\p{P}\p{S}]/u;
 
-function detectLang(text) {
-    const words = text.toLowerCase().match(/[a-zåäöéü']+/g) || [];
-    let sv = 0, en = 0;
-    for (const w of words) {
-        if (SV_WORDS.has(w)) sv++;
-        else if (EN_WORDS.has(w)) en++;
-    }
-    const diacritics = Math.min((text.match(/[åäöÅÄÖ]/g) || []).length, 2);
-    if (sv + en + diacritics === 0) return null;
-    return sv + diacritics > en ? "sv" : "en";
+function detectLang(sentence, only) {
+    if (NON_LATIN.test(sentence)) return francAll(sentence, { only, minLength: 1 })[0][0];
+    const words = sentence.toLowerCase().match(/[\p{L}']+/gu) || [];
+    if (words.length < 2) return null;
+    const [[top], ...rest] = francAll(sentence, { only, minLength: 1 });
+    if (top === "eng" || top === "und") return "eng";
+    const eng = rest.find(([lang]) => lang === "eng")?.[1] ?? 0;
+    const enShare = words.filter((w) => EN_WORDS.has(w)).length / words.length;
+    return eng >= 0.9 || enShare >= 0.25 ? "eng" : top;
 }
 
 // Split into sentences, detect each one, let undetectable ones inherit a neighbour, merge same-language runs
-function splitByLanguage(text) {
-    const sentences = text.split(/(?<=[.!?…])\s+/).filter(Boolean);
-    const langs = sentences.map(detectLang);
-    let prev = langs.find(Boolean) || "en";
+function splitByLanguage(text, only) {
+    const sentences = text.split(/(?<=[.!?…])\s+|(?<=[。！？])/).filter((s) => s.trim());
+    const langs = sentences.map((s) => detectLang(s, only));
+    let prev = langs.find(Boolean) || "eng";
     const filled = langs.map((l) => (prev = l || prev));
     const segments = [];
     sentences.forEach((s, i) => {
@@ -194,12 +204,12 @@ function splitByLanguage(text) {
     return segments;
 }
 
-function getVoice(lang, sid) {
-    if (lang === "sv") {
-        const tts = getSvTts();
-        if (tts) return { tts, sid: 0, name: "sv nst" };
-    }
-    return { tts: ttsEn, sid, name: `en sid ${sid}` };
+// languages: [{ franc, voice }], the Piper voice for each enabled language
+function getVoice(lang, sid, languages) {
+    const voice = languages.find((l) => l.franc === lang)?.voice;
+    const tts = voice && getPiper(voice);
+    if (tts) return { tts, sid: 0, name: voice };
+    return { tts: ttsEn, sid, name: `kokoro sid ${sid}` };
 }
 
 const [playerCmd, playerArgs] = choosePlayer();
@@ -255,13 +265,14 @@ rl.on("line", async (line) => {
     }
 
     if (req.type === "speak") {
-        const { text, speed = 1.0, sid = 0, swedish = false, id } = req;
+        const { text, speed = 1.0, sid = 0, languages = [], id } = req;
         log(`speak request: id=${id}, text="${text.slice(0, 80)}"`);
 
         try {
-            const segments = swedish ? splitByLanguage(text) : [{ lang: "en", text }];
+            const only = ["eng", ...languages.map((l) => l.franc)];
+            const segments = languages.length ? splitByLanguage(text, only) : [{ lang: "eng", text }];
             for (const seg of segments) {
-                await speakSegment(getVoice(seg.lang, sid), seg.text, speed);
+                await speakSegment(getVoice(seg.lang, sid, languages), seg.text, speed);
             }
 
             log(`playback done for id=${id}`);

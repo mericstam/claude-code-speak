@@ -1,7 +1,9 @@
 // Claude Speak bridge — started by the kokoro-speak mod, under Linux node or Windows node.exe.
-// Sets up its home on first use (sherpa-onnx-node from npm, the Kokoro model), then feeds
-// tts-worker.mjs from a spool folder: the mod drops <time>-<n>.json files
-// ({ text, speed, sid, swedish }) and this speaks them in order. One bridge per home; it
+// Sets up its home on first use (sherpa-onnx-node and franc-all from npm, the Kokoro model),
+// then feeds tts-worker.mjs from a spool folder: the mod drops <time>-<n>.json files
+// ({ text, speed, sid, languages }) and this speaks them in order. A Piper voice for each of
+// `languages` ([{ franc, voice }]) is downloaded in the background the first time it is asked
+// for; a { prepare: true, languages } file only starts those downloads. One bridge per home; it
 // exits once no Claude session has written a heartbeat (hb-*) for a while.
 //
 //   node bridge.mjs <claude-speak home>
@@ -17,20 +19,22 @@ const ALIVE = join(homeDir, "bridge.alive");
 const STATUS = join(homeDir, "status.txt");
 const LOG_PATH = join(homeDir, "bridge.log");
 const HEARTBEAT_TTL = 45_000;
-const SHERPA_VERSION = "1.12.40";
+const PACKAGES = ["sherpa-onnx-node@1.12.40", "franc-all@7.2.0"];
 
 const MODEL = {
     url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2",
     dir: join(MODELS, "kokoro-en-v0_19"),
     marker: "model.onnx",
     label: "Kokoro model (~305MB)",
+    key: "kokoro-en-v0_19",
 };
-const SV_MODEL = {
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-sv_SE-nst-medium.tar.bz2",
-    dir: join(MODELS, "vits-piper-sv_SE-nst-medium"),
-    marker: "sv_SE-nst-medium.onnx",
-    label: "Swedish model (~64MB)",
-};
+const piperModel = (voice) => ({
+    url: `https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-${voice}.tar.bz2`,
+    dir: join(MODELS, `vits-piper-${voice}`),
+    marker: `${voice}.onnx`,
+    label: `Piper voice ${voice}`,
+    key: voice,
+});
 
 mkdirSync(SPOOL, { recursive: true });
 
@@ -69,24 +73,26 @@ function run(cmd, args, options = {}) {
     });
 }
 
-async function ensureSherpa() {
-    if (existsSync(join(homeDir, "node_modules", "sherpa-onnx-node"))) return;
-    status("setup: installing sherpa-onnx…");
-    const pkg = `sherpa-onnx-node@${SHERPA_VERSION}`;
+async function ensurePackages() {
+    const missing = PACKAGES.filter((p) => !existsSync(join(homeDir, "node_modules", p.slice(0, p.lastIndexOf("@")))));
+    if (!missing.length) return;
+    status(`setup: installing ${missing.join(", ")}…`);
     if (process.platform === "win32") {
         // npm is a .cmd script on Windows, which only a shell runs
-        await run(`npm.cmd install --prefix "${homeDir}" ${pkg} --no-audit --no-fund`, [], { shell: true });
+        await run(`npm.cmd install --prefix "${homeDir}" ${missing.join(" ")} --no-audit --no-fund`, [], { shell: true });
     } else {
-        await run("npm", ["install", "--prefix", homeDir, pkg, "--no-audit", "--no-fund"]);
+        await run("npm", ["install", "--prefix", homeDir, ...missing, "--no-audit", "--no-fund"]);
     }
 }
 
-// Downloads a .tar.bz2 into models/ (the archive's top-level folder is the model's dir)
-async function ensureModel({ url, dir, marker, label }) {
-    if (existsSync(join(dir, marker))) return;
-    status(`setup: downloading ${label}…`);
+// Downloads a .tar.bz2 into models/ (the archive's top-level folder is the model's dir).
+// While it runs, models/.download-<key>.tar.bz2 exists: the mod reads that as "downloading".
+// Resolves true when it downloaded, false when the model was already there.
+async function ensureModel({ url, dir, marker, label, key }, report = status) {
+    if (existsSync(join(dir, marker))) return false;
+    report(`setup: downloading ${label}…`);
     mkdirSync(MODELS, { recursive: true });
-    const tarPath = join(MODELS, `.download-${process.pid}.tar.bz2`);
+    const tarPath = join(MODELS, `.download-${key}.tar.bz2`);
     try {
         const response = await fetch(url);
         if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
@@ -95,15 +101,19 @@ async function ensureModel({ url, dir, marker, label }) {
     } finally {
         try { unlinkSync(tarPath); } catch {}
     }
+    return true;
 }
 
-let svModel = null;
-function ensureSwedish() {
-    svModel ??= ensureModel(SV_MODEL).catch((err) => {
-        log(`Swedish model download failed: ${err.message}`);
-        svModel = null;
-    });
-    return svModel;
+const voiceDownloads = new Map(); // voice id → its download, while it runs
+function ensureVoices(languages = []) {
+    for (const { voice } of languages) {
+        if (!voice || voiceDownloads.has(voice)) continue;
+        const download = ensureModel(piperModel(voice), log)
+            .then((downloaded) => downloaded && log(`Piper voice ${voice} ready`))
+            .catch((err) => log(`Piper voice ${voice} download failed: ${err.message}`))
+            .finally(() => voiceDownloads.delete(voice));
+        voiceDownloads.set(voice, download);
+    }
 }
 
 // ── Worker ─────────────────────────────────────────────────────────
@@ -143,7 +153,8 @@ function ensureWorker() {
 }
 
 async function speak(req) {
-    if (req.swedish) await ensureSwedish();
+    // A language's sentences are read by Kokoro until its voice is downloaded
+    ensureVoices(req.languages);
     await ensureWorker();
     const id = ++requestId;
     await new Promise((resolve) => {
@@ -162,7 +173,7 @@ function hasLiveSession() {
 }
 
 try {
-    await ensureSherpa();
+    await ensurePackages();
     await ensureModel(MODEL);
     await ensureWorker();
     status("ready");
@@ -188,10 +199,14 @@ for (;;) {
             continue; // still being written
         }
         try { unlinkSync(path); } catch {}
+        if (req.prepare) {
+            ensureVoices(req.languages);
+            continue;
+        }
         if (!req.text) continue;
         log(`speaking ${name}: "${req.text.slice(0, 60)}"`);
         try {
-            await speak({ text: req.text, speed: req.speed ?? 1, sid: req.sid ?? 0, swedish: !!req.swedish });
+            await speak({ text: req.text, speed: req.speed ?? 1, sid: req.sid ?? 0, languages: req.languages ?? [] });
         } catch (err) {
             log(`speak failed: ${err.message}`);
         }
