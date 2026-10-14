@@ -19,6 +19,7 @@ const ALIVE = join(homeDir, "bridge.alive");
 const STATUS = join(homeDir, "status.txt");
 const LOG_PATH = join(homeDir, "bridge.log");
 const HEARTBEAT_TTL = 45_000;
+const STALE_HEARTBEAT = 3_600_000;
 const PACKAGES = ["sherpa-onnx-node@1.12.40", "franc-all@7.2.0"];
 
 const MODEL = {
@@ -167,9 +168,16 @@ async function speak(req) {
 
 let readyAt = Date.now();
 
+// Also removes the heartbeats of sessions that ended over an hour ago
 function hasLiveSession() {
-    if (Date.now() - readyAt < HEARTBEAT_TTL) return true;
-    return readdirSync(homeDir).some((f) => f.startsWith("hb-") && ageMs(join(homeDir, f)) < HEARTBEAT_TTL);
+    let live = Date.now() - readyAt < HEARTBEAT_TTL;
+    for (const f of readdirSync(homeDir)) {
+        if (!f.startsWith("hb-")) continue;
+        const age = ageMs(join(homeDir, f));
+        if (age < HEARTBEAT_TTL) live = true;
+        else if (age > STALE_HEARTBEAT) try { unlinkSync(join(homeDir, f)); } catch {}
+    }
+    return live;
 }
 
 try {

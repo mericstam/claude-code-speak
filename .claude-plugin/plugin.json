@@ -1,6 +1,6 @@
 {
   "name": "kokoro-speak",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Reads Claude's replies aloud with local text-to-speech: Kokoro for English, Piper voices for 41 more languages",
   "author": {
     "name": "mericstam"
