@@ -1,5 +1,10 @@
-// Persistent TTS worker — stays alive, receives commands via stdin JSON lines
-// Generates speech via sherpa-onnx and streams PCM to ffplay
+// Persistent TTS worker — stays alive, receives commands via stdin JSON lines.
+// Adapted from copilot-cli-speak: generates speech via sherpa-onnx and streams PCM
+// to a player (ffplay on Windows/macOS; paplay, pw-play, aplay or ffplay on Linux).
+//
+//   node tts-worker.mjs <claude-speak home>
+//
+// The home holds node_modules/sherpa-onnx-node and models/, both set up by bridge.mjs.
 import { createRequire } from "node:module";
 import { spawn, execSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -7,44 +12,37 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, unlinkSync, statSync, appendFileSync } from "node:fs";
 import { platform as osPlatform, availableParallelism } from "node:os";
 
-const extDir = process.argv[2];
+const homeDir = process.argv[2];
 
-const LOG_PATH = join(extDir, ".cache", "debug.log");
+const LOG_PATH = join(homeDir, "bridge.log");
 function log(msg) {
     try {
-        mkdirSync(join(extDir, ".cache"), { recursive: true });
-        appendFileSync(LOG_PATH, `${new Date().toISOString()} [worker] ${msg}\n`);
+        appendFileSync(LOG_PATH, `${new Date().toISOString()} [worker ${process.pid}] ${msg}\n`);
     } catch {}
 }
 
 // ── Load sherpa-onnx ───────────────────────────────────────────────
 
-const nativeDir = join(extDir, "native");
-const require = createRequire(join(nativeDir, "sherpa-onnx-node", "package.json"));
+const require = createRequire(join(homeDir, "package.json"));
 
 log("loading sherpa-onnx...");
-const sherpa_onnx = require("./sherpa-onnx.js");
+const sherpa_onnx = require("sherpa-onnx-node");
 log("sherpa-onnx loaded");
 
-const MODEL_DIR = join(extDir, ".cache", "kokoro-en-v0_19");
-const SV_MODEL_DIR = join(extDir, ".cache", "vits-piper-sv_SE-nst-medium");
-const FFPLAY_DIR = join(extDir, ".cache", "ffplay");
+const MODEL_DIR = join(homeDir, "models", "kokoro-en-v0_19");
+const SV_MODEL_DIR = join(homeDir, "models", "vits-piper-sv_SE-nst-medium");
+const FFPLAY_DIR = join(homeDir, "ffplay");
 const NUM_THREADS = Math.max(2, Math.min(8, availableParallelism()));
 
-// ── ffplay download ────────────────────────────────────────────────
+// ── Player ─────────────────────────────────────────────────────────
 
 const FFPLAY_URLS = {
     "win32": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
     "darwin": "https://ffmpeg.martin-riedl.de/releases/macos/arm64/snapshot/ffplay.zip",
 };
 
-function getFfplayPath() {
-    const ext = osPlatform() === "win32" ? ".exe" : "";
-    return join(FFPLAY_DIR, `ffplay${ext}`);
-}
-
 function ensureFfplay() {
-    const ffplayPath = getFfplayPath();
+    const ffplayPath = join(FFPLAY_DIR, osPlatform() === "win32" ? "ffplay.exe" : "ffplay");
     if (existsSync(ffplayPath)) return ffplayPath;
 
     mkdirSync(FFPLAY_DIR, { recursive: true });
@@ -69,6 +67,36 @@ function ensureFfplay() {
     return ffplayPath;
 }
 
+function hasCommand(cmd) {
+    try {
+        execSync(`command -v ${cmd}`, { stdio: "ignore", shell: "/bin/sh" });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+const ffplayArgs = (rate) => [
+    "-f", "s16le", "-ar", String(rate), "-ch_layout", "mono",
+    "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0",
+];
+
+// Picks how raw 16-bit mono PCM at a sample rate is played: [command, args(rate)]
+function choosePlayer() {
+    if (osPlatform() !== "linux") return [ensureFfplay(), ffplayArgs];
+    if (hasCommand("paplay")) {
+        return ["paplay", (rate) => ["--raw", "--format=s16le", `--rate=${rate}`, "--channels=1"]];
+    }
+    if (hasCommand("pw-play")) {
+        return ["pw-play", (rate) => ["--format=s16", `--rate=${rate}`, "--channels=1", "-"]];
+    }
+    if (hasCommand("aplay")) {
+        return ["aplay", (rate) => ["-q", "-t", "raw", "-f", "S16_LE", `-r${rate}`, "-c1"]];
+    }
+    if (hasCommand("ffplay")) return ["ffplay", ffplayArgs];
+    throw new Error("No audio player found: install pulseaudio-utils (paplay), pipewire, alsa-utils (aplay) or ffmpeg");
+}
+
 // ── Float32 → 16-bit PCM ──────────────────────────────────────────
 
 function float32ToPcm16(samples) {
@@ -80,7 +108,7 @@ function float32ToPcm16(samples) {
     return buf;
 }
 
-// ── Init TTS + ffplay ──────────────────────────────────────────────
+// ── Init TTS + player ──────────────────────────────────────────────
 
 log("creating TTS instance...");
 const ttsEn = new sherpa_onnx.OfflineTts({
@@ -97,7 +125,7 @@ const ttsEn = new sherpa_onnx.OfflineTts({
     },
     maxNumSentences: 1,
 });
-log("TTS instance created — worker ready");
+log("TTS instance created");
 
 // Swedish voice (Piper NST) is loaded lazily the first time Swedish text shows up
 let ttsSv = null;
@@ -174,8 +202,8 @@ function getVoice(lang, sid) {
     return { tts: ttsEn, sid, name: `en sid ${sid}` };
 }
 
-const ffplayPath = ensureFfplay();
-log(`ffplay at: ${ffplayPath}`);
+const [playerCmd, playerArgs] = choosePlayer();
+log(`player: ${playerCmd}`);
 
 // Signal ready to parent
 process.send?.({ type: "ready" });
@@ -187,14 +215,14 @@ const rl = createInterface({ input: process.stdin });
 async function speakSegment({ tts, sid, name }, text, speed) {
     const config = new sherpa_onnx.GenerationConfig({ sid, speed });
 
-    const player = spawn(ffplayPath, [
-        "-f", "s16le", "-ar", String(tts.sampleRate), "-ch_layout", "mono",
-        "-nodisp", "-autoexit", "-loglevel", "quiet",
-        "-i", "pipe:0",
-    ], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+    const player = spawn(playerCmd, playerArgs(tts.sampleRate), {
+        stdio: ["pipe", "ignore", "ignore"],
+        windowsHide: true,
+    });
 
     let playerError = null;
     player.on("error", (err) => { playerError = err; });
+    player.stdin.on("error", (err) => { playerError = err; });
 
     const t0 = Date.now();
     const audio = await tts.generateAsync({
@@ -215,6 +243,7 @@ async function speakSegment({ tts, sid, name }, text, speed) {
         player.on("close", resolve);
         setTimeout(resolve, 60000);
     });
+    if (playerError) throw playerError;
 }
 
 rl.on("line", async (line) => {
