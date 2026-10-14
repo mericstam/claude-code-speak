@@ -1,0 +1,1 @@
+{ "name": "kokoro-speak", "version": "0.1.0", "description": "Reads Claude's replies aloud with Kokoro TTS, reusing the copilot-cli-speak worker" }
